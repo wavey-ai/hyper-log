@@ -3,7 +3,7 @@
     After=network.target
 
     [Service]
-    ExecStart=/var/opt/hyper-log
+    ExecStart=/var/opt/hyper-log --domain=wavey.io --prefix=test --tags=gb-lon,us-mia,us-lax
     Restart=always
     User=root
     StandardOutput=syslog
