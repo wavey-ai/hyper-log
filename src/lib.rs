@@ -5,13 +5,13 @@ use h3::{
     server::Connection,
 };
 use http::{Method, Response, StatusCode};
-use http_body_util::Full;
-use http_body_util::StreamBody;
+use http_body_util::{Full, StreamBody};
 use hyper::body::Frame;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -19,8 +19,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tcp_changes::{Client, Payload};
 use tls_helpers::{certs_from_base64, privkey_from_base64, tls_acceptor_from_base64};
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, timeout, Duration};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info};
 
@@ -48,12 +49,12 @@ impl HyperLog {
 
     pub async fn start(
         &self,
-        addrs: Vec<SocketAddr>,
     ) -> Result<
         (
             oneshot::Receiver<()>,
             oneshot::Receiver<()>,
             watch::Sender<()>,
+            mpsc::Sender<(String, SocketAddr)>,
         ),
         Box<dyn std::error::Error + Send + Sync>,
     > {
@@ -61,38 +62,93 @@ impl HyperLog {
         let (up_tx, up_rx) = oneshot::channel();
         let (fin_tx, fin_rx) = oneshot::channel();
 
-        let (log_tx, _) = broadcast::channel::<Payload>(16);
+        let (log_tx, _) = broadcast::channel::<(String, Payload)>(1024);
+        let (new_client_tx, mut new_client_rx) = mpsc::channel::<(String, SocketAddr)>(100);
+
+        let clients = Arc::new(Mutex::new(HashMap::new()));
+
+        let fullchain = self.fullchain_pem_base64.to_owned();
+
+        // Listen for new (domain, socket) tuples.
+        let clients_handler = {
+            let mut shutdown_signal = shutdown_rx.clone();
+            let log_tx_clone = log_tx.clone();
+            let clients = Arc::clone(&clients);
+
+            async move {
+                loop {
+                    tokio::select! {
+                        Some((domain, socket)) = new_client_rx.recv() => {
+                            info!("adding domain {} with ip {}", domain, socket.ip());
+                            let clients = Arc::clone(&clients);
+                            {
+                                let lock = clients.lock().await;
+                                if lock.contains_key(&socket) {
+                                    info!("Client already exists for socket: {}", socket);
+                                    continue;
+                                }
+                            }
+
+                            // Create a new MB client for the received domain and socket.
+                            let mb = Client::new(domain.clone(), socket, fullchain.to_owned());
+                            let (mut up_tcp, fin_tcp, mut shutdown_tcp, mut rx) = mb.start("HELLO").await.unwrap();
+                            {
+                                let mut lock = clients.lock().await;
+                                lock.insert(socket, (shutdown_tcp.clone(), domain.clone()));
+                            }
+                            let tx_clone = log_tx_clone.clone();
+                            tokio::spawn(async move {
+                                while let Some(msg) = rx.recv().await {
+                                    tx_clone.send((domain.clone(), msg)).ok();
+                                }
+                            });
+
+                            let clients = Arc::clone(&clients);
+                            // Check if the client becomes unreachable.
+                            tokio::spawn(async move {
+                                let mut heartbeat_interval = interval(Duration::from_secs(10));
+                                loop {
+                                    tokio::select! {
+                                        _ = heartbeat_interval.tick() => {
+                                            // Attempt to receive from the `oneshot::Receiver` with a timeout.
+                                            let res = timeout(Duration::from_secs(60), &mut up_tcp).await;
+
+                                            // Check if the timeout occurred or if the result indicates an error
+                                            if let Err(_) | Ok(Err(_)) = res {
+                                                error!("Client is unreachable: {}", socket);
+                                                let _ = shutdown_tcp.send(());
+                                                {
+                                                    let mut lock = clients.lock().await;
+                                                    lock.remove(&socket);
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+
+                        }
+                        _ = shutdown_signal.changed() => {
+                            break;
+                        }
+                    }
+                }
+            }
+        };
+
+        tokio::spawn(clients_handler);
 
         let addr = SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), self.ssl_port);
         let tls_acceptor =
             tls_acceptor_from_base64(&self.cert_pem_base64, &self.privkey_pem_base64, true, false)?;
 
-        let mut shutdowns = Vec::new();
-        for addr in addrs {
-            let mb = Client::new(
-                "local.wavey.io".to_string(),
-                addr,
-                self.fullchain_pem_base64.to_owned(),
-            );
-
-            let (up_tcp, fin_tcp, shutdown_tcp, mut rx) = mb.start("HELLO").await.unwrap();
-
-            shutdowns.push(shutdown_tcp);
-
-            let tx_clone = log_tx.clone();
-            tokio::spawn(async move {
-                while let Some(msg) = rx.recv().await {
-                    tx_clone.send(msg);
-                }
-            });
-        }
-
-        let ssl_port = self.ssl_port;
-
+        let ssl_port = self.ssl_port.clone();
         let srv_h1 = {
             let mut shutdown_signal = shutdown_rx.clone();
             let tx_clone = log_tx.clone();
             async move {
+                let addr = SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), ssl_port);
                 let incoming = TcpListener::bind(&addr).await.unwrap();
                 let service =
                     service_fn(move |req| handle_request_h1(req, tx_clone.clone(), ssl_port));
@@ -144,24 +200,16 @@ impl HyperLog {
                 .unwrap();
 
             tls_config.max_early_data_size = u32::MAX;
-            let alpn: Vec<Vec<u8>> = vec![
-                b"h3".to_vec(),
-                b"h3-32".to_vec(),
-                b"h3-31".to_vec(),
-                b"h3-30".to_vec(),
-                b"h3-29".to_vec(),
-            ];
+            let alpn: Vec<Vec<u8>> = vec![b"h3".to_vec()];
             tls_config.alpn_protocols = alpn;
 
             let server_config = quinn::ServerConfig::with_crypto(Arc::new(tls_config));
             quinn::Endpoint::server(server_config, addr).unwrap()
         };
 
-        info!("listening at {}", addr);
-
-        let tx_clone = log_tx.clone();
         let srv = {
             let mut shutdown_signal = shutdown_rx.clone();
+            let tx_clone = log_tx.clone();
             async move {
                 loop {
                     tokio::select! {
@@ -183,7 +231,7 @@ impl HyperLog {
 
                                             tokio::spawn(async move {
                                                 if let Err(err) = handle_connection(h3_conn, tx_clone).await {
-                                                    tracing::error!("Failed to handle connection: {err:?}");
+                                                    error!("Failed to handle connection: {err:?}");
                                                 }
                                             });
 
@@ -207,15 +255,17 @@ impl HyperLog {
             let _ = up_tx.send(());
         });
 
+        let clients = Arc::clone(&clients);
         tokio::spawn(async move {
             let _ = shutdown_rx.changed().await;
-            for tx in shutdowns {
-                tx.send(());
+            let mut clients = clients.lock().await;
+            for (_, shutdown_tcp) in clients.drain() {
+                let _ = shutdown_tcp.0.send(());
             }
             fin_tx.send(()).unwrap();
         });
 
-        Ok((up_rx, fin_rx, shutdown_tx))
+        Ok((up_rx, fin_rx, shutdown_tx, new_client_tx))
     }
 }
 
@@ -224,7 +274,7 @@ type ResponseBody = StreamBody<ReceiverStream<Data>>;
 
 async fn handle_request_h1(
     req: Request<impl hyper::body::Body>,
-    mut tcp_tx: broadcast::Sender<Payload>,
+    tcp_tx: broadcast::Sender<(String, Payload)>,
     ssl_port: u16,
 ) -> Result<Response<ResponseBody>, Infallible> {
     let uri = req.uri().clone();
@@ -241,10 +291,8 @@ async fn handle_request_h1(
     let mut tcp_rx = tcp_tx.subscribe();
 
     let (tx, rx) = mpsc::channel::<Data>(10);
-    let mut heartbeat_interval = interval(Duration::from_secs(1));
-
-    let mut heartbeat_interval = interval(Duration::from_secs(1));
-    let mut time_elapsed: Duration = Duration::from_secs(0);
+    let mut heartbeat_interval = interval(Duration::from_secs(30));
+    let time_elapsed: Duration = Duration::from_secs(0);
 
     tokio::spawn(async move {
         let mut time_elapsed = Duration::from_secs(0);
@@ -260,7 +308,7 @@ async fn handle_request_h1(
                             .as_secs()
                     );
                     if tx
-                        .send(Ok(hyper::body::Frame::data(Bytes::from(heartbeat_message))))
+                        .send(Ok(Frame::data(Bytes::from(heartbeat_message))))
                         .await
                         .is_err()
                     {
@@ -273,10 +321,10 @@ async fn handle_request_h1(
                         }
                     }
             }
-                Ok(payload) = tcp_rx.recv() => {
-                    let mut data = payload.val;
-                    tx.send(Ok(hyper::body::Frame::data(Bytes::from(data)))).await;
-                    tx.send(Ok(hyper::body::Frame::data(Bytes::from(&b"\n"[..])))).await;
+                Ok(msg) = tcp_rx.recv() => {
+                    let data = prepend_tag(msg.0, msg.1.val);
+                    let  _ = tx.send(Ok(Frame::data(Bytes::from(data)))).await;
+                    let  _ = tx.send(Ok(Frame::data(Bytes::from(&b"\n"[..])))).await;
                 }
             }
         }
@@ -285,7 +333,7 @@ async fn handle_request_h1(
     let stream = ReceiverStream::new(rx);
     let body = StreamBody::new(stream);
 
-    Ok(Response::builder()
+    let result = Ok(Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain")
         .header("transfer-encoding", "chunked")
@@ -294,58 +342,58 @@ async fn handle_request_h1(
             format!("h3=\":{}\"; ma=3600; persist=1", ssl_port),
         )
         .body(body)
-        .unwrap())
+        .unwrap());
+    result
 }
 
 async fn handle_connection(
     mut conn: Connection<h3_quinn::Connection, Bytes>,
-    mut tx: broadcast::Sender<Payload>,
+    mut tx: broadcast::Sender<(String, Payload)>,
 ) -> Result<()> {
     loop {
         match conn.accept().await {
-            Ok(Some((req, mut stream))) => match req.method() {
-                &Method::GET => {
-                    let response = http::Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "text/event-stream")
-                        .body(())
-                        .unwrap();
+            Ok(Some((req, mut stream))) => {
+                return match req.method() {
+                    &Method::GET => {
+                        let response = http::Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "text/event-stream")
+                            .body(())?;
 
-                    match stream.send_response(response).await {
-                        Ok(_) => {}
-                        Err(err) => {
-                            error!("unable to send response to connection peer: {:?}", err);
-                        }
-                    }
-
-                    let mut heartbeat_interval = interval(Duration::from_secs(1));
-                    let mut time_elapsed: Duration = Duration::from_secs(0);
-                    let mut rx = tx.subscribe();
-                    loop {
-                        tokio::select! {
-                            _ = heartbeat_interval.tick() => {
-                                let heartbeat_message = Bytes::from(format!("heartbeat {}\n", SystemTime::now().duration_since(UNIX_EPOCH).expect("time error").as_secs()));
-                                if let Err(err) = stream.send_data(heartbeat_message.clone()).await {
-                                    error!("Failed to send heartbeat: {:?}", err);
-                                    break;
-                                }
-                            }
-                            Ok(payload) = rx.recv() => {
-                                let data = payload.val;
-                                if let Err(err) = stream.send_data(data).await {
-                                    error!("Failed to send data: {:?}", err);
-                                    break;
-                                }
+                        match stream.send_response(response).await {
+                            Ok(_) => {}
+                            Err(err) => {
+                                error!("unable to send response to connection peer: {:?}", err);
                             }
                         }
-                    }
 
-                    return Ok(());
+                        let mut heartbeat_interval = interval(Duration::from_secs(1));
+                        let time_elapsed: Duration = Duration::from_secs(0);
+                        let mut rx = tx.subscribe();
+                        loop {
+                            tokio::select! {
+                                _ = heartbeat_interval.tick() => {
+                                    let heartbeat_message = Bytes::from(format!("heartbeat {}\n", SystemTime::now().duration_since(UNIX_EPOCH).expect("time error").as_secs()));
+                                    if let Err(err) = stream.send_data(heartbeat_message.clone()).await {
+                                        error!("Failed to send heartbeat: {:?}", err);
+                                        break;
+                                    }
+                                }
+                                Ok(msg) = rx.recv() => {
+                                    let data = prepend_tag(msg.0, msg.1.val);
+                                    if let Err(err) = stream.send_data(data).await {
+                                        error!("Failed to send data: {:?}", err);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        Ok(())
+                    }
+                    _ => Ok(()),
                 }
-                _ => {
-                    return Ok(());
-                }
-            },
+            }
             Ok(None) => {
                 break;
             }
@@ -357,4 +405,12 @@ async fn handle_connection(
     }
 
     Ok(())
+}
+
+fn prepend_tag(tag: String, data: Bytes) -> Bytes {
+    let mut msg_bytes = tag.into_bytes();
+    msg_bytes.push(b' ');
+    let mut new_data = msg_bytes;
+    new_data.extend_from_slice(&data);
+    new_data.into()
 }
