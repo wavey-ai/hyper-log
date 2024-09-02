@@ -12,7 +12,7 @@ use ts::listener::start_srt_listener;
 use ts::playlist;
 
 #[derive(Debug, StructOpt)]
-#[structopt(name = "hyper-hls")]
+#[structopt(name = "hyper-log")]
 struct Command {
     #[structopt(long, default_value = "4449", env = "SSL_PORT")]
     ssl_port: u16,

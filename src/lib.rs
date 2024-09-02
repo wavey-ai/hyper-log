@@ -157,7 +157,7 @@ impl HyperLog {
             quinn::Endpoint::server(server_config, addr).unwrap()
         };
 
-        println!("Starting to serve on https://{}", addr);
+        info!("listening at {}", addr);
 
         let tx_clone = log_tx.clone();
         let srv = {
