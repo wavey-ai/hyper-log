@@ -8,8 +8,6 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, registry::Registry, EnvFilter};
-use ts::listener::start_srt_listener;
-use ts::playlist;
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "hyper-log")]
